@@ -1,0 +1,9 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    # GitHub rewrites this to the right repository automatically once private
+    # vulnerability reporting is enabled in Settings > Security. Turn that on
+    # before making the repo public, or this link 404s and people file security
+    # bugs as public issues instead.
+    url: https://github.com/security/advisories
+    about: "Do NOT open a public issue for a security problem — see SECURITY.md."

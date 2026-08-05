@@ -1,0 +1,38 @@
+# Secrets — never commit. Everything reaches the runtime as env vars or Docker
+# secrets on the one container that needs it.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+id_rsa*
+
+# Agent runtime state. This is the whole reason the repo is safe to publish:
+# holdings, account values, approvals and the track record live here and must
+# never land in git.
+agents/*/state/
+agents/*/logs/
+*.trigger
+trading.paused
+.msgqueue/
+
+# Runtime artefacts
+# Anchored with a leading slash. An unanchored `backups/` matches at ANY
+# depth — in the sibling repo that silently excluded a whole source
+# package from the first commit.
+/backups/
+/health/
+/workspace/
+*.log
+
+# Node
+node_modules/
+npm-debug.log*
+
+# OS / editor
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+*.swp

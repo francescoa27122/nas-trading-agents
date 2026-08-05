@@ -1,0 +1,9 @@
+{
+  "name": "Daily Trade Ideas",
+  "description": "Every market morning: exactly 3 actionable trade proposals with Telegram Yes/No buttons — read-only analysis; each trade still needs a one-tap Yes",
+  "schedule": "weekly Mon,Tue,Wed,Thu,Fri 09:00",
+  "enabled": true,
+  "delivery": "dashboard",
+  "tools": "portfolio",
+  "max_failures": 3
+}

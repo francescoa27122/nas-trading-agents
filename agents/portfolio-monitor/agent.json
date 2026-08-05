@@ -1,0 +1,8 @@
+{
+  "name": "Portfolio Monitor",
+  "description": "Read-only Robinhood analyst — holdings, trades, and proposals with reasoning",
+  "schedule": "interval 30",
+  "enabled": true,
+  "delivery": "dashboard",
+  "tools": "portfolio"
+}

@@ -1,0 +1,10 @@
+{
+  "name": "Portfolio Review",
+  "description": "Weekly self-grading of the portfolio analyst's proposals — its lessons feed back into the analyst's prompt",
+  "schedule": "weekly Sun 17:00",
+  "enabled": true,
+  "delivery": "dashboard",
+  "tools": "read",
+  "max_failures": 3,
+  "brief": true
+}

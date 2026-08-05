@@ -1,0 +1,28 @@
+# Normalise to LF in the repository. This project is authored on Windows and
+# runs on Linux in Docker; a CRLF that reaches a shell script produces
+#   /bin/sh: bad interpreter: /bin/bash^M
+# and takes the container down at boot with a message that does not obviously
+# point at line endings.
+* text=auto eol=lf
+
+*.sh      text eol=lf
+*.py      text eol=lf
+*.sql     text eol=lf
+*.yml     text eol=lf
+*.yaml    text eol=lf
+*.html    text eol=lf
+*.css     text eol=lf
+*.js      text eol=lf
+*.md      text eol=lf
+Dockerfile text eol=lf
+
+# Never touch these.
+*.png     binary
+*.jpg     binary
+*.ico     binary
+*.woff    binary
+*.woff2   binary
+*.gz      binary
+
+# Keep generated/vendored noise out of diffs and language stats.
+*.svg     linguist-detectable=false
