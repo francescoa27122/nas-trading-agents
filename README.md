@@ -1,18 +1,121 @@
 # nas-trading-agents
 
-A scheduler that runs LLM agents on a home NAS, and a one-tap trade executor that
-places equity orders **only** after a human has explicitly approved that specific
-trade.
+**A scheduler that runs LLM agents on a home NAS, and a one-tap trade executor
+that places an equity order only after a human has approved that exact trade.**
 
-This is the part of a larger self-hosted agent platform that deals with money. It
-is published because the interesting engineering is not "an LLM can call a broker
-API" — that part is easy and mostly a bad idea. The interesting part is everything
-built to stop it going wrong.
+An agent is a folder: an `agent.json` and a `prompt.md`. No registry, no
+database, no control plane — the filesystem *is* the state, so "what is this
+thing about to do?" is answerable with `cat`. Two shell scripts and ~380 lines
+of JavaScript run the whole thing.
+
+Published because the interesting engineering is not "an LLM can call a broker
+API" — that part is easy and mostly a bad idea. The interesting part is
+everything built to stop it going wrong.
 
 > **Nothing here trades on its own.** The model analyses and proposes. A human taps
 > ✅. Only then does a separate, tightly-scoped process place a single order, capped
 > in dollars, capped per pass, capped per day, and re-checked against the approval
 > at the moment of execution. If any check cannot be satisfied, it does not trade.
+
+## What is interesting in here
+
+Most of this is reusable whether or not you care about trading:
+
+- **Capability tiers as a real boundary.** An agent's `agent.json` names a tier;
+  `run-agent.sh` maps it to an explicit `--allowedTools` list. The analyst tier
+  is read-only *by construction* — no analyst, however confused or prompt-injected,
+  can place an order, because the tool is not in its process.
+- **Four execution outcomes, not three.** `placed`, `skipped`, `failed`, and
+  **`unknown`** — the one that matters. See [the bug this design is really
+  about](#the-bug-this-design-is-really-about); it is the difference between one
+  order and two.
+- **Prompt-injection hardening that was earned, not designed.** `{{ENV:}}`
+  substitution is allowlisted per agent and platform secrets are never injectable;
+  `{{FILE:}}` is scanned from `prompt.md` only, because scanning the *substituted*
+  text made a model able to trigger a file read on the **next** run by emitting a
+  literal placeholder. Prompts go in on **stdin, not argv** — as an argument they
+  were readable via `/proc/<pid>/cmdline` by every other process in the container.
+- **A scheduler that tolerates its own agents.** Window-matching rather than
+  exact-minute firing, because a long agent run used to block the loop past the
+  target minute and silently skip the schedule for that day.
+- **Circuit breakers.** An agent that fails `CIRCUIT_BREAKER_FAILS` times in a row
+  pauses itself instead of failing loudly forever.
+- **Tests that SKIP loudly rather than lie.** On Windows a large part of the suite
+  cannot run, and it says so — see [Running the tests](#running-the-tests) for why
+  making it "work" would put an arbitrary-command vector on the money path.
+
+## Run it yourself
+
+**What you need:** Docker, a [Claude Code](https://claude.com/claude-code) OAuth
+token or API key, a Telegram bot (for the approval buttons), and — only if you
+want the executor to do anything — a broker MCP server. This repo deliberately
+ships **no** broker credentials and no MCP server; you supply your own.
+
+This is an extract of the money path from a larger platform, so there is no
+`docker-compose.yml` here. The container contract is small enough to state in
+full:
+
+1. Mount this repo at **`/workspace`** (the paths in `startup.sh` are absolute).
+2. Run on Node 20+ with the `claude` CLI available — `startup.sh` will
+   `npm install -g @anthropic-ai/claude-code` if it is missing.
+3. Set the environment (see [Configuration](#configuration)); at minimum
+   `CLAUDE_CODE_OAUTH_TOKEN`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`.
+4. `bash /workspace/startup.sh`
+
+Roughly:
+
+```bash
+docker run -d --name agents \
+  -v "$PWD:/workspace" \
+  -e CLAUDE_CODE_OAUTH_TOKEN="$CLAUDE_CODE_OAUTH_TOKEN" \
+  -e TELEGRAM_BOT_TOKEN="$TELEGRAM_BOT_TOKEN" \
+  -e TELEGRAM_CHAT_ID="$TELEGRAM_CHAT_ID" \
+  -e MAX_TRADE_USD=100 \
+  node:20 bash /workspace/startup.sh
+```
+
+**Start with the executor disarmed.** Every shipped agent is read-only analysis;
+nothing places an order until you wire a broker MCP server *and* tap ✅. To watch
+the machinery without any broker at all, set every agent to `"enabled": true` and
+read the Telegram proposals — the executor simply finds no approvals to act on.
+
+### Your first agent
+
+```bash
+mkdir -p agents/my-agent/state
+cat > agents/my-agent/agent.json <<'JSON'
+{
+  "name": "My Agent",
+  "description": "What it does, in one line",
+  "schedule": "daily 08:30",
+  "enabled": true,
+  "delivery": "telegram",
+  "tools": "read",
+  "max_failures": 3
+}
+JSON
+echo "Summarise today's market open in five bullets." > agents/my-agent/prompt.md
+```
+
+The scheduler picks it up within ~20 seconds. Things worth knowing before you
+wonder why nothing happened:
+
+- **Schedules** are `daily HH:MM`, `weekly Mon,Tue,… HH:MM`, or `interval N`
+  (minutes). **`interval` skips its first sighting** — on first sight the
+  scheduler only records the timestamp, so a new interval agent fires one full
+  interval later, not immediately.
+- **`delivery` is push-or-nothing here.** Only `"telegram"` sends anything. Any
+  other value (the upstream platform uses `"dashboard"`) means the run is
+  recorded to `state/` and nothing is pushed — correct for that platform, silent
+  in this repo, which ships no dashboard. Start a new agent on `telegram` so you
+  can see it working.
+- **Reply `SKIP` for quiet success.** An agent whose entire output is `SKIP`
+  counts as a successful run with no delivery and no alert. It is how a
+  "tell me only if something changed" agent stays silent without looking broken.
+- **State lives in `agents/<name>/state/`** — `last_run.json`, `runs.csv`,
+  `latest_output.txt`, and per-agent extras like `value_history.csv`. Raw model
+  transcripts go to `agents/<name>/logs/`, *beside* `state/`, not inside it.
+  `state/` is gitignored and stays that way — it holds holdings and approvals.
 
 ---
 
@@ -114,13 +217,20 @@ the state, which makes "what is this thing about to do" answerable with `cat`.
 
 | tier | grants |
 |---|---|
-| `read` | `WebSearch WebFetch` |
+| `read` | `WebSearch WebFetch` — also the fallback for any unrecognised value |
 | `actions` | + `Bash(curl:*)` |
 | `portfolio` | + read-only broker tools (`get_*` only) |
+| `google` | + `mcp__google` (Workspace), **not** the broker tools |
 | `power` | + `Bash Read Write Edit` — unrestricted; never set from a web form |
 
 `portfolio` is read-only by construction. No analyst, however confused, can place
 an order.
+
+Tiers are additive in capability but not cumulative in code — each is an explicit
+list in `run-agent.sh`, so reading that `case` statement tells you exactly what an
+agent can do. An unknown tier falls back to `read` rather than erroring, which is
+the safe direction to fail: a typo in `agent.json` costs you a web search, not a
+broker session.
 
 ## Prompt-injection hardening
 
@@ -172,6 +282,61 @@ reports as a clean one.
 
 Secrets live only as environment variables on the container that needs them. They
 are never written into a prompt file or a log.
+
+## Tips and tricks
+
+**Retire an agent with `"enabled": false`, never by deleting the folder.** The
+folder holds `state/runs.csv` — the entire history of what that agent did and
+whether it worked. Deleting it destroys the track record, which is the one thing
+you cannot reconstruct.
+
+**Everything is answerable with `cat` and `tail`.** There is no admin UI to log
+into and no database to query:
+
+```bash
+cat  agents/trade-ideas/state/last_run.json      # did the last run succeed?
+tail agents/trade-ideas/state/runs.csv           # the track record
+tail agents/trade-ideas/logs/*.log               # what the model actually said
+```
+
+Note `logs/` sits beside `state/`, not inside it.
+
+**A failing agent pauses itself.** After N consecutive failures `run-agent.sh`
+rewrites `agent.json` to `"enabled": false` and notifies once, rather than
+retrying forever. N is the agent's own `max_failures`, falling back to
+`CIRCUIT_BREAKER_FAILS`, then to 3 — and `"max_failures": 0` turns the breaker
+off for that agent. **If an agent "stopped working", check `enabled` before you
+debug the prompt**: it may have disabled itself days ago.
+
+**Set `QUIET_HOURS` before you add a chatty agent.** Format `HH:MM-HH:MM`.
+Non-urgent messages queue to `.msgqueue/` and flush afterwards rather than
+waking you at 03:00.
+
+**`MAX_TRADES_PER_DAY` counts across every agent, not per agent.** Adding a
+second proposing agent does not double your ceiling — that is deliberate.
+
+**Unreadable state counts as over the cap.** Every aggregate brake fails
+*closed*: if the executor cannot parse its own counters, it treats itself as
+having hit the limit. Same for approval timestamps — an approval of unknown age
+is not an approval.
+
+**Test prompt changes against a disabled agent first.** Set `"enabled": false`,
+edit `prompt.md`, then run one pass by hand:
+
+```bash
+bash run-agent.sh agents/my-agent
+```
+
+That is the same entry point the scheduler uses, so what you see is what it will
+do.
+
+**Never set `tools: "power"` on anything that reads the open web.** It grants
+`Bash Read Write Edit` with no restriction, and these agents treat web content as
+hostile input for good reason. If a prompt is reachable from a web form or a chat
+command, `power` turns a prompt injection into arbitrary code execution.
+
+**A skipped test run is not a passing one.** On Windows much of the suite SKIPs
+by design (see below). Read the summary line, not the exit code.
 
 ## What is deliberately not here
 
