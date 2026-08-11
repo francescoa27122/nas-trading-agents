@@ -124,6 +124,59 @@ while true; do
     node /workspace/execute-trades.js >/dev/null 2>&1
   fi
 
+  # YouTube analytics fetch (once/day around YOUTUBE_FETCH_TIME, default 06:40). Deterministic,
+  # writes /workspace/youtube/*.json for the Studio dashboard. Same .lastfire gate as digest/backup.
+  YTTIME="${YOUTUBE_FETCH_TIME:-06:40}"
+  if [ -f /workspace/youtube-fetch.js ] && [ "$NOW" = "$YTTIME" ] && [ "$(cat /workspace/.ytfetch.lastfire 2>/dev/null)" != "$NOWSTAMP" ]; then
+    echo "$NOWSTAMP" > /workspace/.ytfetch.lastfire
+    node /workspace/youtube-fetch.js >/dev/null 2>&1
+  fi
+
+  # Kept (site-health) stats fetch for the dashboard's Kept page. Deterministic,
+  # writes /workspace/kept/state.json. Fires every KEPT_FETCH_MIN minutes (default 15)
+  # — or on the NEXT pass when the dashboard drops kept/refresh.trigger (Run-now button).
+  KFMIN="${KEPT_FETCH_MIN:-15}"
+  if [ -f /workspace/kept-fetch.js ]; then
+    klast=$(cat /workspace/.keptfetch.lastrun_epoch 2>/dev/null || echo 0)
+    case "$klast" in ''|*[!0-9]*) klast=0;; esac
+    if [ -f /workspace/kept/refresh.trigger ] || [ $((EPOCH - klast)) -ge $((KFMIN * 60)) ]; then
+      echo "$EPOCH" > /workspace/.keptfetch.lastrun_epoch
+      rm -f /workspace/kept/refresh.trigger
+      node /workspace/kept-fetch.js >/dev/null 2>&1
+      [ -f /workspace/umami-fetch.js ] && node /workspace/umami-fetch.js >/dev/null 2>&1
+    fi
+  fi
+
+  # Minecraft health alerts. Reads only health/minecraft.json and pings Telegram
+  # when the server is up-but-not-answering or backups have gone stale. Same
+  # interval-gate idiom as kept-fetch above; a no-op if the script isn't present.
+  if [ -f /workspace/minecraft-alert.js ]; then
+    mclast=$(cat /workspace/.mcalert.lastrun_epoch 2>/dev/null || echo 0)
+    case "$mclast" in ''|*[!0-9]*) mclast=0;; esac
+    if [ $((EPOCH - mclast)) -ge 300 ]; then
+      echo "$EPOCH" > /workspace/.mcalert.lastrun_epoch
+      node /workspace/minecraft-alert.js >/dev/null 2>&1
+    fi
+  fi
+
+  # Momo review-queue + song-request alerts. Deterministic replacement for the
+  # momo-queue-alert agent (retired 2026-08-02): that agent ran at the `power` tier
+  # — unrestricted root Bash in this container — to diff two JSON files, on input
+  # authored by the off-NAS PC pipeline. This does the same job with no LLM and no
+  # shell, and commits an id to announced.json only once Telegram confirms delivery
+  # (the agent marked ids announced BEFORE sending, permanently burning any that a
+  # timeout or a failed send dropped). Same interval-gate idiom as minecraft-alert
+  # above; a no-op if the script isn't present.
+  MOMOMIN="${MOMO_ALERT_MIN:-30}"
+  if [ -f /workspace/momo-alert.js ]; then
+    molast=$(cat /workspace/.momoalert.lastrun_epoch 2>/dev/null || echo 0)
+    case "$molast" in ''|*[!0-9]*) molast=0;; esac
+    if [ $((EPOCH - molast)) -ge $((MOMOMIN * 60)) ]; then
+      echo "$EPOCH" > /workspace/.momoalert.lastrun_epoch
+      node /workspace/momo-alert.js >/dev/null 2>&1
+    fi
+  fi
+
   # Daily config backup (keeps last 14 in /workspace/backups). Fires at-or-AFTER
   # BACKUP_TIME (default 03:30) with a date-stamped dedupe — same pattern as the
   # brief gate above, so a pass that blows past the exact minute (e.g. a long

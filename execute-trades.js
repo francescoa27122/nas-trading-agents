@@ -32,7 +32,7 @@ const EXEC_TIMEOUT_MS = Math.max(1000, parseInt(process.env.EXEC_TIMEOUT_MS || '
 // and est_value are only ever the model's own claim, and an interrupted run can't be
 // resolved to placed/not-placed (hence the 'unknown' status below). Adding it would
 // be a read-only change that closes both gaps — but widening --allowedTools on the
-// money path needs a human sign-off, so it is proposed, not shipped.
+// money path needs Francesco's sign-off, so it is proposed, not shipped.
 const ALLOWED = [
   'mcp__robinhood__get_accounts', 'mcp__robinhood__get_portfolio',
   'mcp__robinhood__get_equity_positions', 'mcp__robinhood__get_equity_quotes',

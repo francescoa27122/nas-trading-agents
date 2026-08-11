@@ -52,10 +52,10 @@ done
 # Placeholders are read from prompt.md ONLY, and this runs BEFORE the model-authored
 # {{PREVIOUS_OUTPUT}}/{{PROPOSAL_HISTORY}} text is injected (hardened 2026-08-02).
 # Previously the scan ran over the already-substituted prompt, so a model that emitted
-# the literal string {{FILE:/workspace/some.env}} into its own output made the NEXT run
+# the literal string {{FILE:/workspace/kept.env}} into its own output made the NEXT run
 # inject that file — a self-propagating file read reachable from any page a web-capable
-# agent fetched. Credential-shaped paths are refused outright, because /workspace is
-# where sibling services keep their own .env files.
+# agent fetched. Credential-shaped paths are refused outright: /workspace holds
+# kept.env and umami.env (KEPT_ADMIN_TOKEN, UMAMI_PASSWORD).
 for ph in $(grep -o '{{FILE:/workspace/[^}]*}}' "$AGENT_DIR/prompt.md" 2>/dev/null | sort -u); do
   fp=${ph#\{\{FILE:}; fp=${fp%\}\}}
   case "$fp" in
@@ -197,6 +197,12 @@ if [ "$TOOLS" = "portfolio" ]; then
   [ -f /workspace/track-proposals.js ] && command -v node >/dev/null 2>&1 && node /workspace/track-proposals.js "$AGENT_DIR" >/dev/null 2>&1
   # Push any new proposals to Telegram with Yes/No buttons (never trades).
   [ -f /workspace/notify-proposals.js ] && command -v node >/dev/null 2>&1 && node /workspace/notify-proposals.js "$AGENT_DIR" >/dev/null 2>&1
+fi
+
+# YouTube coach: persist the recommendation JSON the coach emitted into /workspace/youtube/
+# (keeps the LLM itself read-only — the deterministic post-processor does the file write).
+if [ "$(basename "$AGENT_DIR")" = "youtube-coach" ]; then
+  [ -f /workspace/youtube-coach.js ] && command -v node >/dev/null 2>&1 && node /workspace/youtube-coach.js "$AGENT_DIR" >/dev/null 2>&1
 fi
 
 # run history (keep last 200)
