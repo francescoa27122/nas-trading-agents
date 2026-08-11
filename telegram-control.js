@@ -21,7 +21,7 @@ const WS    = process.env.WORKSPACE || '/workspace';
 const AGENTS = WS + '/agents';
 const OFFSET_FILE = WS + '/.tg_offset';
 const CMDS_STAMP  = WS + '/.tg_cmds_version';
-const CMDS_VERSION = '2';
+const CMDS_VERSION = '3';   // bump to re-register the menu (v3 added /halt, /qd)
 const MSGQ = WS + '/.msgqueue';
 const API = `https://api.telegram.org/bot${TOKEN}`;
 
@@ -175,6 +175,81 @@ async function handleBriefCallback(cq, data) {
   return editKb(cq, briefTuneKeyboard());
 }
 
+// ---- QuantDesk control ----
+// node-1 has no docker socket and no mount into /volume1/docker/quantdesk, so this
+// process cannot stop trading by itself. health-collector has both, and is the only
+// thing on the box that does: we drop <id>.req into the shared workspace, it runs an
+// allowlisted verb against qd-engine and writes <id>.out. See health/collector.sh.
+//
+// Until this existed, quantdesk/README.md listed "Telegram /halt" as one of three
+// equivalent emergency stops and no such command was ever registered.
+const QD_DIR = WS + '/health/qd-console';
+const QD_WAIT_MS = 12000;   // collector polls ~1s; `qd halt` round-trips in ~2s
+const QD_ACTIONS = new Set(['halt', 'resume', 'flatten', 'status', 'kill', 'unkill']);
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+async function qdRequest(action) {
+  if (!QD_ACTIONS.has(action)) return { ok: false, text: 'unknown action' };
+  const id = `${Date.now()}-${process.pid}`;
+  const req = `${QD_DIR}/${id}.req`, out = `${QD_DIR}/${id}.out`;
+  try { fs.mkdirSync(QD_DIR, { recursive: true }); fs.writeFileSync(req, action); }
+  catch (e) { return { ok: false, text: `control channel unreachable: ${e.message}` }; }
+
+  const deadline = Date.now() + QD_WAIT_MS;
+  while (Date.now() < deadline) {
+    await sleep(400);
+    let raw;
+    try { raw = fs.readFileSync(out, 'utf8'); } catch (e) { continue; }  // not answered yet
+    try { fs.unlinkSync(out); } catch (e) {}
+    const m = raw.match(/^--exit:(-?\d+)\s*$/m);
+    return { ok: m ? m[1] === '0' : false, code: m ? parseInt(m[1], 10) : -1,
+             text: raw.replace(/^--exit:-?\d+\s*$/m, '').trim() };
+  }
+  try { fs.unlinkSync(req); } catch (e) {}
+  return { ok: false, timeout: true, text: '' };
+}
+
+// Wording is deliberately precise about queued-vs-done, because the difference is
+// real: `qd halt` inserts a control_commands row the engine applies on its next
+// cycle, while the kill switch is a file the risk gate checks before every order.
+// Saying "halted" when the engine has not yet read the row would be a lie at the
+// exact moment it matters most.
+const QD_DONE = {
+  halt: '🛑 HALT queued.\nThe engine stops opening new positions on its next cycle (~20 s). '
+      + 'Exits still work.\nTo block everything including exits: /qd kill',
+  resume: '▶ Resume queued — the engine picks it up on its next cycle (~20 s).',
+  flatten: '💥 Flatten queued.\nThe engine submits reduce-only market closes next cycle and reports '
+         + 'FLATTEN_COMPLETE once the book is actually flat.',
+  kill: '🔴 KILL SWITCH ENGAGED — in effect now.\nEvery order is blocked, exits included. '
+      + 'Release with /qd unkill.',
+  unkill: '🟢 Kill switch released. Normal risk gates apply again.',
+};
+
+function qdReply(action, r) {
+  if (r.timeout) {
+    return `⚠️ NO CONFIRMATION for "${action}".\nThe request was written but health-collector did not `
+         + `answer in ${QD_WAIT_MS / 1000}s. Assume it did NOT take effect.\n\n`
+         + 'Do it by hand now:\n'
+         + `ssh nas 'docker exec qd-engine qd ${action}'\n`
+         + 'Or the switch that needs nothing working: '
+         + "ssh nas 'docker exec qd-engine touch /app/state/KILL'";
+  }
+  if (!r.ok) {
+    return `⚠️ "${action}" FAILED (exit ${r.code}).\n${(r.text || '(no output)').slice(0, 1200)}\n\n`
+         + "Fallback: ssh nas 'docker exec qd-engine touch /app/state/KILL'";
+  }
+  if (action === 'status') return '📊 QuantDesk\n\n' + (r.text || '(no output)').slice(0, 3500);
+  return QD_DONE[action] || `✓ ${action} done.`;
+}
+
+function qdKeyboard() {
+  return [
+    [{ text: '🛑 Halt', callback_data: 'qd:halt' }, { text: '💥 Flatten', callback_data: 'qd:flatten' }],
+    [{ text: '🔴 Kill switch', callback_data: 'qd:kill' }, { text: '▶ Resume…', callback_data: 'qd:resumeask' }],
+    [{ text: '🔄 Refresh status', callback_data: 'qd:status' }],
+  ];
+}
+
 function setFlag(n, key, val) {
   const p = `${AGENTS}/${n}/agent.json`; const m = readJSON(p, null);
   if (!m) return false;
@@ -190,6 +265,14 @@ const HELP = [
   '/prompt <name> — show an agent\'s prompt',
   '/new <slug> | <schedule> | <what it should do>',
   '/delete <name> — delete an agent (asks to confirm)',
+  '',
+  'QuantDesk:',
+  '/halt — 🛑 stop opening new positions (exits still work)',
+  '/qd — status + control buttons',
+  '/qd flatten — close everything at market',
+  '/qd kill — block ALL orders, exits included',
+  '/qd resume | /qd unkill — undo the above (asks to confirm)',
+  '',
   '/health — reliability digest   /backup — config snapshot',
   '/ask <question> — one-off web question',
   '',
@@ -283,6 +366,36 @@ async function handle(text) {
     return SEND(`Delete ${n} permanently? This removes its config, prompt, and history.`,
       [[{ text: '🗑 Yes, delete', callback_data: `ag:${n}:delyes` }, { text: 'Cancel', callback_data: `ag:${n}:delno` }]]);
   }
+  // ---- QuantDesk ----
+  // `/halt` is top-level and unprefixed on purpose: it is the one command typed
+  // in a hurry, and quantdesk's README has always promised it by that name.
+  // Note `/resume` is NOT overloaded here — it still resumes an agent, as it
+  // always has. Resuming the trading engine is `/qd resume`, behind a confirm.
+  if (cmd === '/halt') {
+    await SEND('🛑 Halting QuantDesk…');
+    return SEND(qdReply('halt', await qdRequest('halt')));
+  }
+  if (cmd === '/qd') {
+    const sub = arg.toLowerCase().trim();
+    if (!sub) {
+      const r = await qdRequest('status');
+      return SEND(qdReply('status', r), qdKeyboard());
+    }
+    // Stopping is never gated (quantdesk ARCHITECTURE.md §9) — halt, flatten and
+    // kill go straight through. Resume and unkill add risk back, so they confirm.
+    if (sub === 'halt' || sub === 'flatten' || sub === 'kill' || sub === 'status') {
+      if (sub !== 'status') await SEND(`Sending ${sub}…`);
+      return SEND(qdReply(sub, await qdRequest(sub)), sub === 'status' ? qdKeyboard() : null);
+    }
+    if (sub === 'resume' || sub === 'unkill') {
+      return SEND(sub === 'resume'
+        ? 'Resume trading? The engine will start opening positions again.'
+        : 'Release the kill switch? Orders will be allowed again.',
+        [[{ text: `✓ Yes, ${sub}`, callback_data: `qd:${sub}:yes` },
+          { text: 'Cancel', callback_data: 'qd:_:no' }]]);
+    }
+    return SEND('Usage: /qd [halt | resume | flatten | kill | unkill]\nNo argument shows status with buttons.');
+  }
   if (cmd === '/health') {
     SPAWN('bash', [`${WS}/digest.sh`]);
     return SEND('📊 Health digest sent.');
@@ -346,6 +459,32 @@ async function handleAgentCallback(cq, data) {
   await ack();
 }
 
+async function handleQdCallback(cq, data) {
+  const parts = data.split(':');                 // qd:<action>[:yes]
+  const action = parts[1] || '';
+  const ack = (text) => realTg('answerCallbackQuery',
+    text ? { callback_query_id: cq.id, text } : { callback_query_id: cq.id });
+
+  if (action === '_' ) { await ack('Cancelled'); return editMsg(cq, 'Cancelled — nothing changed.'); }
+  if (action === 'resumeask') {
+    await ack();
+    return SEND('Resume trading? The engine will start opening positions again.',
+      [[{ text: '✓ Yes, resume', callback_data: 'qd:resume:yes' },
+        { text: 'Cancel', callback_data: 'qd:_:no' }]]);
+  }
+  // resume/unkill only ever arrive here with the :yes suffix from the confirm
+  // keyboard; a bare qd:resume would skip the gate, so require it explicitly.
+  if ((action === 'resume' || action === 'unkill') && parts[2] !== 'yes') return ack();
+  if (!QD_ACTIONS.has(action)) return ack();
+
+  // Answer the tap before the work: Telegram greys the button out after ~10s and
+  // qdRequest can legitimately take 12.
+  await ack(action === 'status' ? 'Refreshing…' : `Sending ${action}…`);
+  const r = await qdRequest(action);
+  if (action === 'status') return editMsg(cq, qdReply('status', r), qdKeyboard());
+  return SEND(qdReply(action, r));
+}
+
 async function handleCallback(cq) {
   if (!cq) return;
   // Must be the OWNER who tapped, not merely a button living in the owner's chat.
@@ -359,6 +498,7 @@ async function handleCallback(cq) {
   if (!owner) { await realTg('answerCallbackQuery', { callback_query_id: cq.id }); return; }
   if (data.startsWith('ag:')) return handleAgentCallback(cq, data);
   if (data.startsWith('br:')) return handleBriefCallback(cq, data);
+  if (data.startsWith('qd:')) return handleQdCallback(cq, data);
   if (!data.startsWith('pf:')) { await realTg('answerCallbackQuery', { callback_query_id: cq.id }); return; }
   const parts = data.split(':');                 // pf:<agent>:<symbol|action>:<yes|no>
   const agent = parts[1]; const dec = parts[parts.length - 1]; const key = parts.slice(2, -1).join(':');
@@ -419,6 +559,8 @@ async function ensureCommands() {
     { command: 'prompt',   description: 'Show an agent\'s prompt' },
     { command: 'new',      description: 'Create an agent: slug | schedule | task' },
     { command: 'delete',   description: 'Delete an agent' },
+    { command: 'halt',     description: '🛑 STOP QuantDesk trading now' },
+    { command: 'qd',       description: 'QuantDesk status + controls' },
     { command: 'health',   description: 'Reliability digest' },
     { command: 'backup',   description: 'Snapshot agent configs' },
     { command: 'ask',      description: 'One-off web question' },
